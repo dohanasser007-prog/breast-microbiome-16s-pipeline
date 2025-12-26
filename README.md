@@ -250,4 +250,4 @@ qiime tools view core-metrics-no-tree/bray_curtis_emperor.qzv
 ---
 
 ## License
-MIT License is recommended for academic code sharing. [file:227]
+MIT License is recommended for academic code sharing. 
