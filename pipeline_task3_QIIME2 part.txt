@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+############################################################
+# Breast Microbiome 16S Pipeline (QIIME 2 + R) — Task 1–3
+# Author: Doha Nasser
+#
+# Goal:
+#   Compare gut microbiome composition between Breast_cancer vs Healthy_control
+#   using 16S rRNA amplicon sequencing.
+#
+# What this script does (reproducible run):
+#   1) Checks inputs (FASTQ + manifests + metadata)
+#   2) QIIME 2 import + DADA2 denoising (per-batch) + merge
+#   3) Diversity analysis (Bray–Curtis, Jaccard, Shannon; plus UniFrac workaround)
+#   4) Top500 workflow: filter ASVs using an existing Top500 FeatureID list,
+#      assign taxonomy with vsearch consensus, export Top500 table/taxonomy for R
+#   5) R plots: genus composition + log2FC (effect size) from Top500 exports
+#   6) Differential abundance: genus-level ANCOM-BC + export + R volcano/barplot
+############################################################
+
+############################
+# 0) Paths and folders
+############################
+PROJECT_DIR="${HOME}/breast_microbiome"
+
+DATA_DIR="${PROJECT_DIR}/data"
+SCRIPTS_DIR="${PROJECT_DIR}/scripts"
+RESULTS_DIR="${PROJECT_DIR}/results"
+FIG_DIR="${RESULTS_DIR}/figures"
+TAB_DIR="${RESULTS_DIR}/tables"
+LOG_DIR="${PROJECT_DIR}/logs"
+R_INPUT_DIR="${PROJECT_DIR}/r_input"
+
+METADATA="${PROJECT_DIR}/metadata.txt"
+TOP500_META="${R_INPUT_DIR}/top500_asv_ids_metadata.tsv"
+
+mkdir -p "${DATA_DIR}" "${SCRIPTS_DIR}" "${RESULTS_DIR}" "${FIG_DIR}" "${TAB_DIR}" "${LOG_DIR}" "${R_INPUT_DIR}"
+
+LOG_FILE="${LOG_DIR}/pipeline.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+echo "===================================================="
+echo "Breast Microbiome Pipeline - Start: $(date)"
+echo "Project dir: ${PROJECT_DIR}"
+echo "Log file   : ${LOG_FILE}"
+echo "===================================================="
+
+############################
+# 1) Activate QIIME 2
+############################
+echo ">>> Loading conda shell hook"
+source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+
+echo ">>> Activating QIIME 2 environment: qiime2-amplicon-2024.10"
+conda activate qiime2-amplicon-2024.10
+
+cd "${PROJECT_DIR}"
+
+############################
+# 2) Input checks (Task 1)
+############################
+echo ">>> Checking inputs"
+
+if [[ ! -f "${METADATA}" ]]; then
+  echo "ERROR: metadata.txt not found at: ${METADATA}"
+  exit 1
+fi
+
+for f in manifest_batch1.tsv manifest_batch2a.tsv manifest_batch2b.tsv; do
+  if [[ ! -f "${PROJECT_DIR}/${f}" ]]; then
+    echo "ERROR: Missing manifest file: ${PROJECT_DIR}/${f}"
+    exit 1
+  fi
+done
+
+FASTQ_COUNT=$(find "${DATA_DIR}" -maxdepth 1 -type f -name "*.fastq*" | wc -l || true)
+if [[ "${FASTQ_COUNT}" -eq 0 ]]; then
+  echo "WARNING: No FASTQ files found in ${DATA_DIR}."
+  echo "         If starting from scratch, download FASTQs from SRA and place them in data/."
+else
+  echo "Found ${FASTQ_COUNT} FASTQ files in ${DATA_DIR}"
+fi
+
+if [[ ! -f "${TOP500_META}" ]]; then
+  echo "ERROR: Top500 FeatureID metadata file not found:"
+  echo "       ${TOP500_META}"
+  echo "       (This file is required for the Top500 taxonomy workflow.)"
+  exit 1
+fi
+
+############################
+# 3) QIIME 2 import + DADA2 (Task 2A)
+############################
+SAMPLING_DEPTH=50000
+
+run_import_dada2 () {
+  local manifest="$1"
+  local demux="$2"
+  local table="$3"
+  local repseqs="$4"
+  local stats="$5"
+
+  echo ">>> Importing ${manifest} -> ${demux}"
+  qiime tools import \
+    --type 'SampleData[SequencesWithQuality]' \
+    --input-path "${manifest}" \
+    --output-path "${demux}" \
+    --input-format SingleEndFastqManifestPhred33V2
+
+  echo ">>> DADA2 denoise-single -> ${table}, ${repseqs}"
+  qiime dada2 denoise-single \
+    --i-demultiplexed-seqs "${demux}" \
+    --p-trim-left 0 \
+    --p-trunc-len 280 \
+    --p-n-reads-learn 20000 \
+    --p-max-ee 2 \
+    --p-chimera-method consensus \
+    --p-n-threads 1 \
+    --o-table "${table}" \
+    --o-representative-sequences "${repseqs}" \
+    --o-denoising-stats "${stats}"
+}
+
+echo ">>> QIIME 2: Import + DADA2 per batch"
+run_import_dada2 manifest_batch1.tsv  demux-batch1.qza  table-batch1.qza  rep-seqs-batch1.qza  denoising-stats-batch1.qza
+run_import_dada2 manifest_batch2a.tsv demux-batch2a.qza table-batch2a.qza rep-seqs-batch2a.qza denoising-stats-batch2a.qza
+run_import_dada2 manifest_batch2b.tsv demux-batch2b.qza table-batch2b.qza rep-seqs-batch2b.qza denoising-stats-batch2b.qza
+
+############################
+# 4) Merge + summaries
+############################
+echo ">>> Merging feature tables"
+qiime feature-table merge \
+  --i-tables table-batch1.qza table-batch2a.qza table-batch2b.qza \
+  --o-merged-table table-all.qza
+
+echo ">>> Merging representative sequences"
+qiime feature-table merge-seqs \
+  --i-data rep-seqs-batch1.qza rep-seqs-batch2a.qza rep-seqs-batch2b.qza \
+  --o-merged-data rep-seqs-all.qza
+
+echo ">>> Summarizing merged table"
+qiime feature-table summarize \
+  --i-table table-all.qza \
+  --m-sample-metadata-file "${METADATA}" \
+  --o-visualization table-all.qzv
+
+echo ">>> Tabulating representative sequences"
+qiime feature-table tabulate-seqs \
+  --i-data rep-seqs-all.qza \
+  --o-visualization rep-seqs-all.qzv
+
+############################
+# 5) Diversity analysis (Task 2C)
+############################
+echo ">>> Running non-phylogenetic core metrics at sampling depth: ${SAMPLING_DEPTH}"
+qiime diversity core-metrics \
+  --i-table table-all.qza \
+  --p-sampling-depth "${SAMPLING_DEPTH}" \
+  --m-metadata-file "${METADATA}" \
+  --output-dir core-metrics-no-tree
+
+echo ">>> Beta group significance (Bray–Curtis) by Status"
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-no-tree/bray_curtis_distance_matrix.qza \
+  --m-metadata-file "${METADATA}" \
+  --m-metadata-column Status \
+  --o-visualization core-metrics-no-tree/bray-curtis-Status-significance.qzv \
+  --p-permutations 999 \
+  --p-pairwise
+
+echo ">>> Alpha group significance (Shannon)"
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity core-metrics-no-tree/shannon_vector.qza \
+  --m-metadata-file "${METADATA}" \
+  --o-visualization core-metrics-no-tree/shannon-Status-significance.qzv
+
+############################
+# 6) Top500 taxonomy workflow (Task 2B)
+############################
+echo ">>> Filter sequences to Top500 ASVs"
+qiime feature-table filter-seqs \
+  --i-data rep-seqs-all.qza \
+  --m-metadata-file "${TOP500_META}" \
+  --o-filtered-data rep-seqs-top500.qza
+# filter-seqs docs: https://docs.qiime2.org/2024.10/plugins/available/feature-table/filter-seqs/ [web:567]
+
+echo ">>> Filter table to Top500 ASVs"
+qiime feature-table filter-features \
+  --i-table table-all.qza \
+  --m-metadata-file "${TOP500_META}" \
+  --o-filtered-table table-top500.qza
+
+echo ">>> Assign taxonomy (Top500) using vsearch consensus"
+qiime feature-classifier classify-consensus-vsearch \
+  --i-query rep-seqs-top500.qza \
+  --i-reference-reads refs_silva/silva-138-99-seqs.qza \
+  --i-reference-taxonomy refs_silva/silva-138-99-tax.qza \
+  --p-perc-identity 0.97 \
+  --p-threads 1 \
+  --o-classification taxonomy-top500.qza \
+  --o-search-results taxonomy-top500-hits.qza
+# vsearch classifier docs: https://docs.qiime2.org/2024.10/plugins/available/feature-classifier/classify-consensus-vsearch/ [web:513]
+
+echo ">>> Export Top500 taxonomy for R"
+qiime tools export \
+  --input-path taxonomy-top500.qza \
+  --output-path "${R_INPUT_DIR}/exported-taxonomy-top500"
+
+echo ">>> Export Top500 table for R (BIOM -> TSV)"
+qiime tools export \
+  --input-path table-top500.qza \
+  --output-path "${R_INPUT_DIR}/exported-table-top500"
+
+if ! command -v biom >/dev/null 2>&1; then
+  echo "ERROR: biom is required to convert BIOM -> TSV. Please install biom-format."
+  exit 1
+fi
+
+biom convert \
+  -i "${R_INPUT_DIR}/exported-table-top500/feature-table.biom" \
+  -o "${R_INPUT_DIR}/feature-table-top500.tsv" \
+  --to-tsv
+
+############################
+# 7) Genus plots in R (Top500)
+############################
+echo ">>> Running R: Top500 genus plots"
+Rscript "${SCRIPTS_DIR}/plot_top500_genus.R"
+
+############################
+# 8) Differential abundance (ANCOM-BC) at genus level
+############################
+echo ">>> Collapse Top500 table to genus level"
+qiime taxa collapse \
+  --i-table table-top500.qza \
+  --i-taxonomy taxonomy-top500.qza \
+  --p-level 6 \
+  --o-collapsed-table genus-top500.qza
+
+echo ">>> Filter rare genera (min total frequency = 10)"
+qiime feature-table filter-features \
+  --i-table genus-top500.qza \
+  --p-min-frequency 10 \
+  --o-filtered-table genus-top500-filt.qza
+
+echo ">>> Run ANCOM-BC (formula: Status)"
+qiime composition ancombc \
+  --i-table genus-top500-filt.qza \
+  --m-metadata-file "${METADATA}" \
+  --p-formula "Status" \
+  --o-differentials ancombc_genus_top500.qza
+# ANCOM-BC docs: https://docs.qiime2.org/2024.10/plugins/available/composition/ancombc/ [web:630]
+
+echo ">>> Tabulate ANCOM-BC results"
+qiime composition tabulate \
+  --i-data ancombc_genus_top500.qza \
+  --o-visualization ancombc_genus_top500.qzv
+# tabulate docs: https://docs.qiime2.org/2024.10/plugins/available/composition/tabulate/ [web:666]
+
+echo ">>> Export ANCOM-BC results for R plotting"
+qiime tools export \
+  --input-path ancombc_genus_top500.qza \
+  --output-path "${R_INPUT_DIR}/ancombc_genus_top500_export"
+
+############################
+# 9) Plot ANCOM-BC results in R (volcano + top significant)
+############################
+echo ">>> Running R: ANCOM-BC volcano + significant barplot"
+Rscript "${SCRIPTS_DIR}/plot_ancombc_genus.R"
+
+echo "===================================================="
+echo "Pipeline finished successfully: $(date)"
+echo "Figures: ${FIG_DIR}"
+echo "Tables : ${TAB_DIR}"
+echo "===================================================="
